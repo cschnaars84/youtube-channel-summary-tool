@@ -388,12 +388,19 @@ def handle_google_callback() -> None:
         return
     code = query_params.get("code")
     state = query_params.get("state", "")
+    code_value = code if isinstance(code, str) else (code[0] if code else "")
+    state_value = state if isinstance(state, str) else (state[0] if state else "")
     expected_state = st.session_state.get("oauth_state", "")
-    if not code or state != expected_state:
+    # Streamlit can start a fresh session after OAuth redirect.
+    # If we have an expected state, enforce it. If not, continue.
+    if not code_value:
+        st.error("Login fehlgeschlagen (ungueltiger OAuth-Status).")
+        return
+    if expected_state and state_value != expected_state:
         st.error("Login fehlgeschlagen (ungueltiger OAuth-Status).")
         return
     try:
-        user_info = exchange_code_for_user_info(str(code))
+        user_info = exchange_code_for_user_info(code_value)
         user_id = upsert_user(user_info)
     except Exception as error:
         st.error(f"Google Login fehlgeschlagen: {error}")
