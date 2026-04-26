@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
+import requests
 import streamlit as st
 from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -19,6 +22,7 @@ CHANNELS_FILE = BASE_DIR / "channels.json"
 VIDEO_STATE_FILE = BASE_DIR / "video_state.json"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 VIDEO_META_CACHE_FILE = BASE_DIR / "video_meta_cache.json"
+APP_DB_FILE = BASE_DIR / "app.db"
 
 DEFAULT_SUMMARY_MODEL = "gpt-4o-mini"
 
@@ -132,31 +136,173 @@ def inject_modern_styles() -> None:
     )
 
 
-def load_channels() -> list[dict[str, str]]:
-    if not CHANNELS_FILE.exists():
-        return []
-    with CHANNELS_FILE.open("r", encoding="utf-8") as file:
-        return json.load(file)
+def get_db_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(APP_DB_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
-def save_channels(channels: list[dict[str, str]]) -> None:
-    with CHANNELS_FILE.open("w", encoding="utf-8") as file:
-        json.dump(channels, file, ensure_ascii=False, indent=2)
+def init_db() -> None:
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                google_sub TEXT UNIQUE NOT NULL,
+                email TEXT NOT NULL,
+                name TEXT,
+                picture TEXT,
+                created_at TEXT NOT NULL,
+                last_login_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, url),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS video_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                video_id TEXT NOT NULL,
+                title TEXT,
+                url TEXT,
+                channel_name TEXT,
+                timestamp INTEGER,
+                published_at TEXT,
+                read INTEGER DEFAULT 0,
+                insights_json TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, video_id),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
 
 
-def load_video_state() -> dict[str, Any]:
-    if not VIDEO_STATE_FILE.exists():
-        return {"videos": {}}
-    with VIDEO_STATE_FILE.open("r", encoding="utf-8") as file:
-        data = json.load(file)
-    if "videos" not in data or not isinstance(data["videos"], dict):
-        return {"videos": {}}
-    return data
+def utc_now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def save_video_state(state: dict[str, Any]) -> None:
-    with VIDEO_STATE_FILE.open("w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False, indent=2)
+def upsert_user(user_info: dict[str, Any]) -> int:
+    google_sub = user_info.get("sub")
+    email = user_info.get("email", "")
+    name = user_info.get("name", "")
+    picture = user_info.get("picture", "")
+    now = utc_now_iso()
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO users (google_sub, email, name, picture, created_at, last_login_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(google_sub) DO UPDATE SET
+                email = excluded.email,
+                name = excluded.name,
+                picture = excluded.picture,
+                last_login_at = excluded.last_login_at
+            """,
+            (google_sub, email, name, picture, now, now),
+        )
+        row = connection.execute("SELECT id FROM users WHERE google_sub = ?", (google_sub,)).fetchone()
+    return int(row["id"])
+
+
+def load_channels(user_id: int) -> list[dict[str, str]]:
+    with get_db_connection() as connection:
+        rows = connection.execute(
+            "SELECT title, url FROM channels WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        ).fetchall()
+    return [{"title": row["title"], "url": row["url"]} for row in rows]
+
+
+def insert_channel(user_id: int, title: str, url: str) -> None:
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO channels (user_id, title, url, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, title, url, utc_now_iso()),
+        )
+
+
+def delete_channel(user_id: int, url: str) -> None:
+    with get_db_connection() as connection:
+        connection.execute("DELETE FROM channels WHERE user_id = ? AND url = ?", (user_id, url))
+
+
+def load_video_state(user_id: int) -> dict[str, Any]:
+    with get_db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT video_id, title, url, channel_name, timestamp, published_at, read, insights_json
+            FROM video_states
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchall()
+    videos: dict[str, Any] = {}
+    for row in rows:
+        insights = []
+        if row["insights_json"]:
+            try:
+                insights = json.loads(row["insights_json"])
+            except json.JSONDecodeError:
+                insights = []
+        videos[row["video_id"]] = {
+            "title": row["title"] or "",
+            "url": row["url"] or "",
+            "channel_name": row["channel_name"] or "",
+            "timestamp": row["timestamp"],
+            "published_at": row["published_at"] or "",
+            "read": bool(row["read"]),
+            "insights": insights,
+        }
+    return {"videos": videos}
+
+
+def upsert_video_state(user_id: int, video_id: str, state: dict[str, Any]) -> None:
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO video_states (
+                user_id, video_id, title, url, channel_name, timestamp, published_at, read, insights_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, video_id) DO UPDATE SET
+                title = excluded.title,
+                url = excluded.url,
+                channel_name = excluded.channel_name,
+                timestamp = excluded.timestamp,
+                published_at = excluded.published_at,
+                read = excluded.read,
+                insights_json = excluded.insights_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user_id,
+                video_id,
+                state.get("title", ""),
+                state.get("url", ""),
+                state.get("channel_name", ""),
+                state.get("timestamp"),
+                state.get("published_at", ""),
+                1 if state.get("read") else 0,
+                json.dumps(state.get("insights", []), ensure_ascii=False),
+                utc_now_iso(),
+            ),
+        )
 
 
 def load_settings() -> dict[str, Any]:
@@ -183,6 +329,79 @@ def get_openai_api_key() -> str:
     except Exception:
         secret_value = ""
     return secret_value or os.getenv("OPENAI_API_KEY", "")
+
+
+def get_google_oauth_config() -> dict[str, str]:
+    try:
+        return {
+            "client_id": st.secrets.get("GOOGLE_CLIENT_ID", ""),
+            "client_secret": st.secrets.get("GOOGLE_CLIENT_SECRET", ""),
+            "redirect_uri": st.secrets.get("GOOGLE_REDIRECT_URI", ""),
+        }
+    except Exception:
+        return {"client_id": "", "client_secret": "", "redirect_uri": ""}
+
+
+def build_google_login_url() -> str:
+    config = get_google_oauth_config()
+    state = secrets.token_urlsafe(24)
+    st.session_state.oauth_state = state
+    params = {
+        "client_id": config["client_id"],
+        "redirect_uri": config["redirect_uri"],
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+
+
+def exchange_code_for_user_info(code: str) -> dict[str, Any]:
+    config = get_google_oauth_config()
+    token_response = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+            "redirect_uri": config["redirect_uri"],
+            "grant_type": "authorization_code",
+        },
+        timeout=20,
+    )
+    token_response.raise_for_status()
+    access_token = token_response.json().get("access_token")
+    profile_response = requests.get(
+        "https://openidconnect.googleapis.com/v1/userinfo",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=20,
+    )
+    profile_response.raise_for_status()
+    return profile_response.json()
+
+
+def handle_google_callback() -> None:
+    query_params = st.query_params
+    if "code" not in query_params:
+        return
+    code = query_params.get("code")
+    state = query_params.get("state", "")
+    expected_state = st.session_state.get("oauth_state", "")
+    if not code or state != expected_state:
+        st.error("Login fehlgeschlagen (ungueltiger OAuth-Status).")
+        return
+    try:
+        user_info = exchange_code_for_user_info(str(code))
+        user_id = upsert_user(user_info)
+    except Exception as error:
+        st.error(f"Google Login fehlgeschlagen: {error}")
+        return
+    st.session_state.auth_user = user_info
+    st.session_state.user_id = user_id
+    st.query_params.clear()
+    st.rerun()
 
 
 def load_video_meta_cache() -> dict[str, Any]:
@@ -458,27 +677,36 @@ def generate_insights_with_llm(transcript: str, video_title: str, api_key: str, 
 
 
 def ensure_session_state() -> None:
+    init_db()
     if "channels" not in st.session_state:
-        loaded_channels = load_channels()
-        normalized_channels: list[dict[str, str]] = []
-        changed = False
-        for channel in loaded_channels:
-            normalized_url = normalize_channel_url(channel.get("url", ""))
-            title = channel.get("title", fallback_channel_title(normalized_url))
-            normalized_channels.append({"title": title, "url": normalized_url})
-            if normalized_url != channel.get("url", ""):
-                changed = True
-        st.session_state.channels = normalized_channels
-        if changed:
-            save_channels(normalized_channels)
+        st.session_state.channels = []
     if "videos_by_channel" not in st.session_state:
         st.session_state.videos_by_channel = {}
     if "video_state" not in st.session_state:
-        st.session_state.video_state = load_video_state()
+        st.session_state.video_state = {"videos": {}}
     if "settings" not in st.session_state:
         st.session_state.settings = load_settings()
     if "video_meta_cache" not in st.session_state:
         st.session_state.video_meta_cache = load_video_meta_cache()
+    if "auth_user" not in st.session_state:
+        st.session_state.auth_user = None
+    if "user_id" not in st.session_state:
+        st.session_state.user_id = None
+    if "loaded_user_id" not in st.session_state:
+        st.session_state.loaded_user_id = None
+
+
+def hydrate_user_state_if_needed() -> None:
+    user_id = st.session_state.user_id
+    if not user_id:
+        return
+    if st.session_state.loaded_user_id == user_id:
+        return
+    st.session_state.channels = load_channels(user_id)
+    st.session_state.video_state = load_video_state(user_id)
+    st.session_state.videos_by_channel = {}
+    st.session_state.all_videos = []
+    st.session_state.loaded_user_id = user_id
 
 
 def add_channel(channel_url: str) -> None:
@@ -492,17 +720,17 @@ def add_channel(channel_url: str) -> None:
 
     try:
         title = resolve_channel_title(channel_url)
-        st.session_state.channels.append({"title": title, "url": channel_url})
-        save_channels(st.session_state.channels)
+        insert_channel(st.session_state.user_id, title, channel_url)
+        st.session_state.channels = load_channels(st.session_state.user_id)
         st.success(f"Channel hinzugefuegt: {title}")
     except Exception as error:
         st.error(f"Channel konnte nicht geladen werden: {error}")
 
 
 def remove_channel(channel_url: str) -> None:
-    st.session_state.channels = [channel for channel in st.session_state.channels if channel["url"] != channel_url]
+    delete_channel(st.session_state.user_id, channel_url)
+    st.session_state.channels = load_channels(st.session_state.user_id)
     st.session_state.videos_by_channel.pop(channel_url, None)
-    save_channels(st.session_state.channels)
     st.success("Channel entfernt.")
 
 
@@ -558,7 +786,7 @@ def update_video_state(video: dict[str, Any], *, insights: list[str] | None = No
     current["timestamp"] = video.get("timestamp")
     current["published_at"] = format_published_at(video)
     videos_state[video["id"]] = current
-    save_video_state(st.session_state.video_state)
+    upsert_video_state(st.session_state.user_id, video["id"], current)
 
 
 def load_videos_for_all_channels(limit: int = 10) -> list[dict[str, Any]]:
@@ -610,7 +838,7 @@ def render_video_list(videos: list[dict[str, Any]], openai_api_key: str, model_n
                     with st.spinner("Transkript wird geladen und analysiert..."):
                         try:
                             if not openai_api_key:
-                                st.error("Bitte OpenAI API Key in der Sidebar eintragen.")
+                                st.error("Kein OpenAI Key gesetzt. Bitte `OPENAI_API_KEY` in Streamlit Secrets konfigurieren.")
                                 continue
                             transcript = fetch_transcript(video["id"])
                             insights = generate_insights_with_llm(
@@ -639,7 +867,29 @@ def render_video_list(videos: list[dict[str, Any]], openai_api_key: str, model_n
 def main() -> None:
     st.set_page_config(page_title="YouTube Channel Summaries", layout="wide")
     ensure_session_state()
+    handle_google_callback()
+    hydrate_user_state_if_needed()
     inject_modern_styles()
+
+    oauth_config = get_google_oauth_config()
+    if not st.session_state.auth_user:
+        st.markdown(
+            (
+                '<div class="hero">'
+                '<div class="app-title">YouTube Intelligence Dashboard</div>'
+                '<div class="app-subtitle">Bitte zuerst mit Google anmelden, um deine persoenliche Channel- und Videoliste zu nutzen.</div>'
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        if not (oauth_config["client_id"] and oauth_config["client_secret"] and oauth_config["redirect_uri"]):
+            st.error(
+                "Google OAuth ist noch nicht konfiguriert. Setze in Streamlit Secrets: "
+                "`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`."
+            )
+            return
+        st.link_button("Mit Google anmelden", build_google_login_url(), use_container_width=True)
+        return
 
     total_channels = len(st.session_state.channels)
     read_count = sum(1 for video in st.session_state.video_state.get("videos", {}).values() if video.get("read"))
@@ -655,6 +905,13 @@ def main() -> None:
     )
 
     with st.sidebar:
+        user = st.session_state.auth_user or {}
+        st.caption(f"Angemeldet als: {user.get('email', 'Unbekannt')}")
+        if st.button("Abmelden"):
+            for key in ["auth_user", "user_id", "loaded_user_id", "channels", "video_state", "videos_by_channel", "all_videos"]:
+                st.session_state.pop(key, None)
+            st.rerun()
+        st.divider()
         st.header("Kanaele")
         new_channel_url = st.text_input("Neue Channel-URL")
         if st.button("Channel speichern"):
