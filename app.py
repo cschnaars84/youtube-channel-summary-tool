@@ -332,7 +332,7 @@ def get_google_oauth_config() -> dict[str, str]:
         return {"client_id": "", "client_secret": "", "redirect_uri": ""}
 
 
-def build_google_login_url() -> str:
+def build_google_login_url(*, force_account_selection: bool = False) -> str:
     config = get_google_oauth_config()
     state = secrets.token_urlsafe(24)
     st.session_state.oauth_state = state
@@ -344,6 +344,8 @@ def build_google_login_url() -> str:
         "state": state,
         "include_granted_scopes": "true",
     }
+    if force_account_selection:
+        params["prompt"] = "select_account"
     return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
 
 
@@ -913,6 +915,7 @@ def main() -> None:
     with st.sidebar:
         user = st.session_state.auth_user or {}
         st.caption(f"Angemeldet als: {user.get('email', 'Unbekannt')}")
+        st.link_button("User wechseln", build_google_login_url(force_account_selection=True), use_container_width=True)
         if st.button("Abmelden"):
             for key in ["auth_user", "user_id", "loaded_user_id", "channels", "video_state", "videos_by_channel", "all_videos"]:
                 st.session_state.pop(key, None)
