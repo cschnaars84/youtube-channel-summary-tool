@@ -342,8 +342,7 @@ def build_google_login_url() -> str:
         "response_type": "code",
         "scope": "openid email profile",
         "state": state,
-        "access_type": "offline",
-        "prompt": "consent",
+        "include_granted_scopes": "true",
     }
     return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
 
@@ -916,11 +915,8 @@ def main() -> None:
         st.subheader("Zusammenfassung")
         openai_api_key = get_openai_api_key()
         model_name = get_openai_model()
-        if openai_api_key:
-            st.caption("OpenAI API Key wird aus Secrets/Umgebungsvariable verwendet.")
-        else:
+        if not openai_api_key:
             st.warning("Kein OpenAI API Key gefunden. Bitte in Streamlit Secrets `OPENAI_API_KEY` setzen.")
-        st.caption(f"Aktives Modell (Backend): `{model_name}`")
 
         if st.session_state.channels:
             removable = st.selectbox(
