@@ -712,13 +712,11 @@ def add_channel(channel_url: str) -> None:
         st.info("Channel ist bereits gespeichert.")
         return
 
-    try:
-        title = resolve_channel_title(channel_url)
-        insert_channel(st.session_state.user_id, title, channel_url)
-        st.session_state.channels = load_channels(st.session_state.user_id)
-        st.success(f"Channel hinzugefuegt: {title}")
-    except Exception as error:
-        st.error(f"Channel konnte nicht geladen werden: {error}")
+    # Keep channel creation fast: avoid blocking network call on save.
+    title = fallback_channel_title(channel_url)
+    insert_channel(st.session_state.user_id, title, channel_url)
+    st.session_state.channels = load_channels(st.session_state.user_id)
+    st.success(f"Channel hinzugefuegt: {title}")
 
 
 def remove_channel(channel_url: str) -> None:
@@ -758,6 +756,20 @@ def format_view_count(view_count: Any) -> str:
     return f"{view_count:,}".replace(",", ".")
 
 
+def to_sort_timestamp(video: dict[str, Any]) -> int:
+    ts = video.get("timestamp")
+    if isinstance(ts, (int, float)):
+        return int(ts)
+    upload_date = video.get("upload_date")
+    if isinstance(upload_date, str) and len(upload_date) == 8 and upload_date.isdigit():
+        try:
+            dt = datetime.strptime(upload_date, "%Y%m%d")
+            return int(dt.timestamp())
+        except ValueError:
+            return 0
+    return 0
+
+
 def get_video_state(video_id: str) -> dict[str, Any]:
     videos_state = st.session_state.video_state.get("videos", {})
     if video_id in videos_state:
@@ -793,7 +805,7 @@ def load_videos_for_all_channels(limit: int = 10) -> list[dict[str, Any]]:
             enriched = dict(video)
             enriched["channel_name"] = channel["title"]
             aggregated.append(enriched)
-    return sorted(aggregated, key=lambda video: (video.get("timestamp") or 0), reverse=True)
+    return sorted(aggregated, key=to_sort_timestamp, reverse=True)
 
 
 def render_video_list(videos: list[dict[str, Any]], openai_api_key: str, model_name: str) -> None:
