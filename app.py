@@ -20,7 +20,6 @@ from yt_dlp import YoutubeDL
 BASE_DIR = Path(__file__).resolve().parent
 CHANNELS_FILE = BASE_DIR / "channels.json"
 VIDEO_STATE_FILE = BASE_DIR / "video_state.json"
-SETTINGS_FILE = BASE_DIR / "settings.json"
 VIDEO_META_CACHE_FILE = BASE_DIR / "video_meta_cache.json"
 APP_DB_FILE = BASE_DIR / "app.db"
 
@@ -305,23 +304,6 @@ def upsert_video_state(user_id: int, video_id: str, state: dict[str, Any]) -> No
         )
 
 
-def load_settings() -> dict[str, Any]:
-    if not SETTINGS_FILE.exists():
-        return {"openai_model": DEFAULT_SUMMARY_MODEL}
-    with SETTINGS_FILE.open("r", encoding="utf-8") as file:
-        data = json.load(file)
-    cleaned = {"openai_model": data.get("openai_model", DEFAULT_SUMMARY_MODEL)}
-    # Migration: remove legacy stored API key from local settings file.
-    if "openai_api_key" in data:
-        save_settings(cleaned)
-    return cleaned
-
-
-def save_settings(settings: dict[str, Any]) -> None:
-    with SETTINGS_FILE.open("w", encoding="utf-8") as file:
-        json.dump(settings, file, ensure_ascii=False, indent=2)
-
-
 def get_openai_api_key() -> str:
     # Streamlit Cloud secrets first, local env fallback for development.
     try:
@@ -329,6 +311,14 @@ def get_openai_api_key() -> str:
     except Exception:
         secret_value = ""
     return secret_value or os.getenv("OPENAI_API_KEY", "")
+
+
+def get_openai_model() -> str:
+    try:
+        model_from_secret = st.secrets.get("OPENAI_MODEL", "")
+    except Exception:
+        model_from_secret = ""
+    return model_from_secret or os.getenv("OPENAI_MODEL", DEFAULT_SUMMARY_MODEL)
 
 
 def get_google_oauth_config() -> dict[str, str]:
@@ -691,8 +681,6 @@ def ensure_session_state() -> None:
         st.session_state.videos_by_channel = {}
     if "video_state" not in st.session_state:
         st.session_state.video_state = {"videos": {}}
-    if "settings" not in st.session_state:
-        st.session_state.settings = load_settings()
     if "video_meta_cache" not in st.session_state:
         st.session_state.video_meta_cache = load_video_meta_cache()
     if "auth_user" not in st.session_state:
@@ -927,21 +915,12 @@ def main() -> None:
         st.divider()
         st.subheader("Zusammenfassung")
         openai_api_key = get_openai_api_key()
+        model_name = get_openai_model()
         if openai_api_key:
             st.caption("OpenAI API Key wird aus Secrets/Umgebungsvariable verwendet.")
         else:
             st.warning("Kein OpenAI API Key gefunden. Bitte in Streamlit Secrets `OPENAI_API_KEY` setzen.")
-        model_name = st.text_input(
-            "OpenAI Modell",
-            value=st.session_state.settings.get("openai_model", DEFAULT_SUMMARY_MODEL),
-            key="openai_model_input",
-        )
-        if st.button("Modelleinstellung speichern"):
-            st.session_state.settings = {
-                "openai_model": model_name.strip() or DEFAULT_SUMMARY_MODEL,
-            }
-            save_settings(st.session_state.settings)
-            st.success("Modelleinstellung gespeichert.")
+        st.caption(f"Aktives Modell (Backend): `{model_name}`")
 
         if st.session_state.channels:
             removable = st.selectbox(
